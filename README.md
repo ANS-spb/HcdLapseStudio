@@ -1,11 +1,16 @@
-Пока это попытка запустить Windows-вайбкодинг под мак
+*Установка на Windows:*
 
-Установка на macOS через Homebrew:
+Скачайте и запустите EXE со страницы релизов: \
+https://github.com/hcdrunk/HcdLapseStudio/releases
 
-$ brew install git uv python-tk
-$ git clone https://github.com/hcdrunk/HcdLapseStudio
-$ cd HcdLapseStudio
-$ uv python install 3.13
-$ uv venv --clear --python 3.13
-$ uv pip install -r requirements.txt
-$ uv run timelapse_app.py
+Установка на macOS через [Homebrew](https://brew.sh):
+
+```bash
+brew install git uv python-tk \
+git clone https://github.com/hcdrunk/HcdLapseStudio \
+cd HcdLapseStudio \
+uv python install 3.13 \
+uv venv --clear --python 3.13\ 
+uv pip install -r requirements.txt\ 
+uv run timelapse_app.py\ 
+```
