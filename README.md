@@ -1,9 +1,9 @@
-*Установка на Windows:*
+**Установка на Windows:**
 
 Скачайте и запустите EXE со страницы релизов: \
 https://github.com/hcdrunk/HcdLapseStudio/releases
 
-Установка на macOS через [Homebrew](https://brew.sh):
+**Установка на macOS** через [Homebrew](https://brew.sh):
 
 ```bash
 brew install git uv python-tk \
