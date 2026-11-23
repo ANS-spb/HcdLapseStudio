@@ -1,7 +1,7 @@
 import re
 import threading
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image
 import imageio_ffmpeg
@@ -14,7 +14,8 @@ from lr_mouse import setup_mouse_drag
 ctk.set_appearance_mode("dark")
 
 def natural_sort_key(path: Path):
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', path.name)]
+    # Сортируем полный относительный путь: сначала папки, затем файлы внутри них.
+    return [(0, int(t)) if t.isdigit() else (1, t.lower()) for t in re.split(r'(\d+)', path.as_posix())]
 
 class TimelapseStudioApp(ctk.CTk):
     def __init__(self):
@@ -31,6 +32,9 @@ class TimelapseStudioApp(ctk.CTk):
         self.thumb_cache = {}
         self.secret_clicks = 0
         self.last_preview_size = (660, 500)
+        self._preview_resize_job = None
+        self._preview_update_job = None
+        self._last_preview_target = None
         self.drag_target = None
         self.is_playing = False
         self.is_rendering = False
@@ -38,6 +42,9 @@ class TimelapseStudioApp(ctk.CTk):
         self.current_proc = None
         build_lr_interface(self)
         setup_mouse_drag(self)
+        # Отслеживаем размер панели, а не самой картинки: размер изображения не
+        # должен менять минимальную ширину колонок и запускать цикл перерисовки.
+        self.preview_area.bind("<Configure>", self._on_preview_resize)
 
     def reset_horizon(self):
         self.sl_rot.set(0.0)
@@ -69,8 +76,12 @@ class TimelapseStudioApp(ctk.CTk):
             self.after(2000, overlay.destroy)
 
     def reset_color(self):
-        for sl, val in [(self.sl_exp, 0.0), (self.sl_con, 1.0), (self.sl_hi, 0.0), (self.sl_sh, 0.0), (self.sl_sat, 1.0), (self.sl_tmp, 0.0), (self.sl_sharp, 0.0)]:
+        for sl, val in [(self.sl_exp, 0.0), (self.sl_con, 1.0), (self.sl_hi, 0.0), (self.sl_sh, 0.0), (self.sl_sat, 1.0), (self.sl_tmp, 0.0), (self.sl_tint, 0.0), (self.sl_sharp, 0.0)]:
             sl.set(val)
+        self.ent_tmp.delete(0, "end")
+        self.ent_tmp.insert(0, "+0 K")
+        self.ent_tint.delete(0, "end")
+        self.ent_tint.insert(0, "+0 ")
         self.refresh_preview()
 
     def select_save_dir(self):
@@ -97,42 +108,164 @@ class TimelapseStudioApp(ctk.CTk):
         self.count_lbl.configure(text=f"{n} кадров  |  {dur:.1f} сек  |  ~{max(1, int(dur * mb_per_sec))} МБ")
 
     def select_folder(self):
-        folder_str = filedialog.askdirectory(initialdir=str(self.desktop_path), title="Выберите папку с фото или RAW")
-        if not folder_str:
+        # tkinter.askdirectory не умеет выбирать несколько папок за один раз,
+        # поэтому предлагаем добавлять папки по очереди.
+        first = filedialog.askdirectory(
+            initialdir=str(self.desktop_path),
+            title="Выберите первую папку с фото или RAW"
+        )
+        if not first:
             return
-        folder = Path(folder_str)
-        files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in self.photo_exts]
+
+        folders = [Path(first)]
+        while messagebox.askyesno(
+            "Добавить папку",
+            "Добавить ещё одну папку с фотографиями?",
+            parent=self
+        ):
+            next_folder = filedialog.askdirectory(
+                initialdir=str(folders[-1]),
+                title="Выберите следующую папку"
+            )
+            if not next_folder:
+                break
+            candidate = Path(next_folder)
+            # Не добавляем один и тот же каталог повторно.
+            try:
+                candidate_key = str(candidate.resolve()).lower()
+                existing = {str(item.resolve()).lower() for item in folders}
+            except Exception:
+                candidate_key = str(candidate).lower()
+                existing = {str(item).lower() for item in folders}
+            if candidate_key not in existing:
+                folders.append(candidate)
+
+        include_subfolders = messagebox.askyesno(
+            "Импорт подпапок",
+            "Искать фотографии и во вложенных подпапках?\n\n"
+            "Да — искать во всех подпапках\n"
+            "Нет — только непосредственно в выбранных папках",
+            parent=self
+        )
+        ignore_raw = messagebox.askyesno(
+            "Импорт RAW",
+            "Игнорировать RAW-файлы?\n\n"
+            "Да — загрузить только готовые изображения (JPEG, PNG, TIFF и т.д.)\n"
+            "Нет — загрузить готовые изображения и RAW-файлы",
+            parent=self
+        )
+
+        self.status_lbl.configure(
+            text=f"Поиск изображений в {len(folders)} папках...",
+            text_color="#38bdf8"
+        )
+        self.update_idletasks()
+
+        found = {}
+        for folder in folders:
+            candidates = folder.rglob("*") if include_subfolders else folder.iterdir()
+            try:
+                for item in candidates:
+                    try:
+                        if not item.is_file():
+                            continue
+                        ext = item.suffix.lower()
+                        if ext not in self.photo_exts:
+                            continue
+                        if ignore_raw and ext in RAW_EXTS:
+                            continue
+                        # resolve() предотвращает дубли, если выбраны вложенные папки.
+                        key = str(item.resolve()).lower()
+                        found[key] = item
+                    except (OSError, PermissionError):
+                        continue
+            except (OSError, PermissionError):
+                continue
+
+        files = list(found.values())
         files.sort(key=natural_sort_key)
+
         if not files:
-            self.status_lbl.configure(text="В папке нет подходящих фото или RAW!", text_color="#facc15")
+            self.status_lbl.configure(
+                text="В выбранных папках нет подходящих изображений!",
+                text_color="#facc15"
+            )
             return
+
         self.is_playing = False
         self.btn_play.configure(text="Play")
         self.image_files = files
         self.thumb_cache.clear()
-        self.folder_lbl.configure(text=str(folder), text_color="#e4e4e7")
+        if len(folders) == 1:
+            folder_text = str(folders[0])
+        else:
+            folder_text = f"{len(folders)} папки: " + ", ".join(f.name for f in folders)
+        self.folder_lbl.configure(text=folder_text, text_color="#e4e4e4")
         self.update_stats()
         max_i = max(1, len(files) - 1)
         self.frame_slider.configure(from_=0, to=max_i, number_of_steps=max_i)
         self.frame_slider.set(0)
         self.show_frame(0)
+        self.status_lbl.configure(
+            text=f"Загружено кадров: {len(files)}",
+            text_color="#34d399"
+        )
 
     def refresh_preview(self):
+        # Объединяем частые события от ползунков: показываем только последнее
+        # значение после короткой паузы, вместо пересчёта на каждое микродвижение.
+        if not self.image_files:
+            return
+        if self._preview_update_job is not None:
+            try:
+                self.after_cancel(self._preview_update_job)
+            except Exception:
+                pass
+        self._preview_update_job = self.after(70, self._run_scheduled_preview)
+
+    def _run_scheduled_preview(self):
+        self._preview_update_job = None
+        if self.image_files:
+            self.show_frame(self.current_idx)
+
+    def _get_preview_target_size(self):
+        # Размер именно внутренней области слева, а не всего окна приложения.
+        width = self.preview_box.winfo_width() - 20
+        height = self.preview_box.winfo_height() - 20
+        if width < 100 or height < 100:
+            return (660, 500)
+        return (width, height)
+
+    def _on_preview_resize(self, event=None):
+        # Configure может приходить сериями во время разворачивания окна.
+        # Объединяем события и пересчитываем изображение только после паузы.
+        size = self._get_preview_target_size()
+        if size == self._last_preview_target:
+            return
+        self._last_preview_target = size
+        if self._preview_resize_job is not None:
+            try:
+                self.after_cancel(self._preview_resize_job)
+            except Exception:
+                pass
+        if self.image_files:
+            self._preview_resize_job = self.after(250, self._refresh_preview_for_resize)
+
+    def _refresh_preview_for_resize(self):
+        self._preview_resize_job = None
         if self.image_files:
             self.show_frame(self.current_idx)
 
     def get_cached_thumb(self, idx: int) -> Image.Image:
         if idx in self.thumb_cache:
             return self.thumb_cache[idx]
-        item = next(iter(self.image_files[idx:idx + 1]))
-        raw = load_any_image(item)
-        if raw.format == "JPEG":
-            raw.draft("RGB", (680, 520))
-        raw = raw.convert("RGB")
-        raw.thumbnail((680, 520))
-        if len(self.thumb_cache) > 300:
-            self.thumb_cache.clear()
-        self.thumb_cache[idx] = raw
+        item = self.image_files[idx]
+        raw = load_any_image(item).convert("RGB")
+        # Храним достаточно крупный исходник для больших окон, но не полный RAW.
+        raw.thumbnail((2560, 2560), Image.Resampling.LANCZOS)
+        if len(self.thumb_cache) >= 8:
+            self.thumb_cache.pop(next(iter(self.thumb_cache)))
+        self.thumb_cache[idx] = raw.copy()
         return raw
 
     def show_frame(self, idx: int):
@@ -141,11 +274,13 @@ class TimelapseStudioApp(ctk.CTk):
         idx = max(0, min(idx, len(self.image_files) - 1))
         self.current_idx = idx
         try:
-            processed = process_preview_image(self, self.get_cached_thumb(idx))
+            target_size = self._get_preview_target_size()
+            processed = process_preview_image(self, self.get_cached_thumb(idx), max_size=target_size)
             c_img = ctk.CTkImage(light_image=processed, dark_image=processed, size=processed.size)
             self.preview_box.configure(image=c_img, text="")
+            self._main_preview_image = c_img
             self.frame_info.configure(text=f"{idx + 1} / {len(self.image_files)}")
-        except Exception:
+        except Exception as exc:
             self.preview_box.configure(image=None, text="Ошибка чтения кадра")
 
     def on_slider_move(self, val):
@@ -196,6 +331,41 @@ class TimelapseStudioApp(ctk.CTk):
             bw, bh = (iw, int(iw * 9 / 16)) if is_horiz else ((int(ih * 9 / 16), ih) if is_vert else (iw, ih))
         return (bw // 2) * 2, (bh // 2) * 2
 
+    def select_audio_file(self):
+        path = filedialog.askopenfilename(
+            title="Выберите аудиофайл",
+            filetypes=[("Аудио", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"), ("Все файлы", "*.*")]
+        )
+        if path:
+            self.audio_path = Path(path)
+            self.audio_silence_sw.deselect()
+            self.audio_file_lbl.configure(text=self.audio_path.name, text_color="#e4e4e7")
+
+    def clear_audio_file(self):
+        self.audio_path = None
+        self.audio_file_lbl.configure(text="Аудио не выбрано", text_color="#a1a1aa")
+
+    def on_audio_silence_toggle(self):
+        # Пустая дорожка и выбранная музыка взаимоисключаются.
+        if self.audio_silence_sw.get() and getattr(self, "audio_path", None):
+            self.clear_audio_file()
+
+    def _collect_audio_settings(self):
+        def number(widget, default, minimum=0.0):
+            try:
+                value = float(widget.get().replace(",", "."))
+                return max(minimum, value)
+            except Exception:
+                return default
+        return {
+            "path": str(self.audio_path) if getattr(self, "audio_path", None) else None,
+            "trim_start": number(self.audio_trim_start, 0.0),
+            "trim_end": number(self.audio_trim_end, 0.0),
+            "delay": number(self.audio_delay, 0.0),
+            "volume": number(self.audio_volume, 100.0) / 100.0,
+            "silence": bool(self.audio_silence_sw.get()),
+        }
+
     def start_render(self, is_test: bool = False):
         if self.is_rendering or not self.image_files:
             if not self.image_files:
@@ -210,6 +380,11 @@ class TimelapseStudioApp(ctk.CTk):
             return
         self.is_playing = False
         self.btn_play.configure(text="Play")
+        self.audio_settings = self._collect_audio_settings()
+        self.lens_enabled = bool(self.lens_sw.get())
+        if self.audio_settings["path"] and self.audio_settings["trim_end"] and self.audio_settings["trim_end"] <= self.audio_settings["trim_start"]:
+            self.status_lbl.configure(text="Конец обрезки аудио должен быть больше начала!", text_color="#f87171")
+            return
         self.is_rendering = True
         self.cancel_requested = False
         self.btn_render.configure(state="disabled")
@@ -238,7 +413,7 @@ class TimelapseStudioApp(ctk.CTk):
         self.progress.set(1 if ok else 0)
         self.btn_render.configure(state="normal")
         self.btn_test.configure(state="normal")
-        self.status_lbl.configure(text=msg, text_color="#34d399" if ok else "#f87171")
+        self.status_lbl.configure(text=msg[:220], text_color="#34d399" if ok else "#f87171")
 
 if __name__ == "__main__":
     app = TimelapseStudioApp()

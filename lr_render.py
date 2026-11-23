@@ -5,6 +5,37 @@ import tempfile
 from pathlib import Path
 from lr_raw import RAW_EXTS, prepare_raw_frames
 from lr_filters import build_ffmpeg_filters
+from lr_lens import apply_lensfun
+from PIL import Image, ImageOps
+
+def prepare_frame_layout(app, frame_paths, tmp_dir: Path, tw: int, th: int):
+    """Prepare contain/blur canvas frames before FFmpeg."""
+    mode = getattr(app, "frame_mode", "Заполнить кадр")
+    if not ("Вписать" in mode or "Размытый" in mode):
+        return frame_paths
+    prepared = []
+    for idx, src in enumerate(frame_paths):
+        if app.cancel_requested:
+            raise RuntimeError("Рендер отменен пользователем")
+        with Image.open(src) as source:
+            img = source.convert("RGB")
+            if "Размытый" in mode:
+                canvas = ImageOps.fit(img, (tw, th), method=Image.Resampling.LANCZOS)
+                canvas = canvas.filter(ImageFilter.GaussianBlur(radius=max(12, int(min(tw, th) * 0.035))))
+                foreground = ImageOps.contain(img, (tw, th), method=Image.Resampling.LANCZOS)
+                canvas.paste(foreground, ((tw - foreground.width) // 2, (th - foreground.height) // 2))
+            else:
+                canvas = Image.new("RGB", (tw, th), (0, 0, 0))
+                foreground = ImageOps.contain(img, (tw, th), method=Image.Resampling.LANCZOS)
+                canvas.paste(foreground, ((tw - foreground.width) // 2, (th - foreground.height) // 2))
+            dst = tmp_dir / f"layout_{idx:06d}.jpg"
+            canvas.save(dst, "JPEG", quality=95)
+            prepared.append(dst)
+        if idx % 25 == 0:
+            app.update_progress((idx + 1) / max(1, len(frame_paths)) * 0.05,
+                                f"Подготовка размещения кадров: {idx + 1}/{len(frame_paths)}")
+    return prepared
+
 
 def format_eta(seconds: float) -> str:
     if seconds < 0 or seconds > 36000:
@@ -18,7 +49,7 @@ def format_eta(seconds: float) -> str:
 def run_ffmpeg_tracked(app, cmd, expected_frames: int, p_start: float, p_end: float, stage_text: str):
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     exe, *args = cmd
-    full_cmd = [exe, "-progress", "pipe:1", "-nostats"] + args
+    full_cmd = [exe, "-hide_banner", "-loglevel", "error", "-progress", "pipe:1", "-nostats"] + args
     proc = subprocess.Popen(
         full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         universal_newlines=True, encoding="utf-8", errors="ignore", bufsize=1, creationflags=flags
@@ -57,7 +88,10 @@ def run_ffmpeg_tracked(app, cmd, expected_frames: int, p_start: float, p_end: fl
     if app.cancel_requested:
         raise RuntimeError("Рендер отменен пользователем")
     if proc.returncode != 0:
-        raise RuntimeError(err_lines.pop() if err_lines else "Ошибка FFmpeg")
+        details = [line for line in err_lines if "error" in line.lower() or "invalid" in line.lower()
+                   or "failed" in line.lower() or "no such" in line.lower()]
+        useful = details[-3:] if details else err_lines[-3:]
+        raise RuntimeError(" | ".join(useful) if useful else "Ошибка FFmpeg")
 
 def execute_render(app, fps: float, is_test: bool = False):
     out_file = app.get_output_path(is_test=is_test)
@@ -72,6 +106,29 @@ def execute_render(app, fps: float, is_test: bool = False):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_p = Path(tmpdir)
             frames_to_use = prepare_raw_frames(app, raw_list, tmp_p, raw_share, format_eta)
+            # Lensfun correction is applied to source frames before FFmpeg filters.
+            if getattr(app, "lens_enabled", False):
+                corrected_frames = []
+                for idx, src in enumerate(frames_to_use):
+                    if app.cancel_requested:
+                        raise RuntimeError("Рендер отменен пользователем")
+                    try:
+                        with Image.open(src) as im:
+                            fixed, _status = apply_lensfun(im.convert("RGB"), raw_list[idx])
+                            if fixed is im:
+                                corrected_frames.append(src)
+                            else:
+                                dst = tmp_p / f"lens_{idx:05d}.jpg"
+                                fixed.save(dst, "JPEG", quality=96)
+                                corrected_frames.append(dst)
+                    except Exception:
+                        corrected_frames.append(src)
+                    if idx % 10 == 0:
+                        app.update_progress(raw_share + (idx + 1) / max(1, len(frames_to_use)) * 0.05,
+                                            f"Коррекция объектива: {idx + 1}/{len(frames_to_use)}")
+                frames_to_use = corrected_frames
+
+            frames_to_use = prepare_frame_layout(app, frames_to_use, tmp_p, tw, th)
             total_frames = len(frames_to_use)
 
             lst = tmp_p / "frames.txt"
@@ -119,7 +176,33 @@ def execute_render(app, fps: float, is_test: bool = False):
             vf = ",".join(final_flts)
             p_start = (raw_share + rem_share * 0.55) if use_stab else raw_share
             label = "Тест-рендер" if is_test else "Экспорт видео"
-            cmd = ([app.ffmpeg_exe, "-y", "-i", str(src_vid)] if src_vid else base_in) + ["-vf", vf, "-c:v", "libx264", "-crf", "17", "-preset", "medium", str(out_file)]
+            cmd = ([app.ffmpeg_exe, "-y", "-i", str(src_vid)] if src_vid else base_in)
+            audio = getattr(app, "audio_settings", {}) or {}
+            video_duration = out_frames / (fps * (2 if use_interp and interp_lvl >= 4 else 1))
+            if audio.get("silence"):
+                cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+                audio_filter = f"atrim=duration={video_duration:.6f}"
+                has_audio = True
+            elif audio.get("path"):
+                cmd += ["-i", audio["path"]]
+                start = max(0.0, float(audio.get("trim_start", 0.0)))
+                end = max(0.0, float(audio.get("trim_end", 0.0)))
+                parts = [f"atrim=start={start:.3f}" + (f":end={end:.3f}" if end > start else ""),
+                         "asetpts=PTS-STARTPTS"]
+                delay_ms = int(max(0.0, float(audio.get("delay", 0.0))) * 1000)
+                if delay_ms:
+                    parts.append(f"adelay={delay_ms}|{delay_ms}")
+                parts.extend([f"volume={max(0.0, float(audio.get('volume', 1.0))):.3f}", "apad",
+                              f"atrim=duration={video_duration:.6f}"])
+                audio_filter = ",".join(parts)
+                has_audio = True
+            else:
+                has_audio = False
+            cmd += ["-vf", vf]
+            if has_audio:
+                cmd += ["-map", "0:v:0", "-map", "1:a:0", "-af", audio_filter,
+                        "-c:a", "aac", "-b:a", "192k", "-t", f"{video_duration:.6f}"]
+            cmd += ["-c:v", "libx264", "-crf", "17", "-preset", "veryfast", str(out_file)]
             run_ffmpeg_tracked(app, cmd, out_frames, p_start, 1.0, label)
 
         app.after(0, lambda: app.finish_render(True, f"Готово! Сохранено:\n{out_file.name}"))

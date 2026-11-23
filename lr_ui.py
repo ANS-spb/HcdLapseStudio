@@ -5,8 +5,10 @@ from lr_panels import build_right_panels
 
 def build_lr_interface(app):
     app.configure(fg_color="#131518")
-    app.grid_columnconfigure(0, weight=5)
-    app.grid_columnconfigure(1, weight=4)
+    # Правая панель имеет постоянную ширину: размер изображения и
+    # ширина левого предпросмотра не должны менять размеры меню.
+    app.grid_columnconfigure(0, weight=1, minsize=560)
+    app.grid_columnconfigure(1, weight=0, minsize=440)
     app.grid_rowconfigure(2, weight=1)
 
     top = ctk.CTkFrame(app, height=48, fg_color="#1b1e23", border_width=1, border_color="#28353a", corner_radius=6)
@@ -28,7 +30,8 @@ def build_lr_interface(app):
     left.grid(row=2, column=0, sticky="nsew", padx=(10, 5), pady=4)
     left.grid_rowconfigure(0, weight=1)
     left.grid_columnconfigure(0, weight=1)
-    app.preview_box = ctk.CTkLabel(left, text="Нажмите «Импорт папки» сверху,\nчтобы загрузить серию снимков", fg_color="#0f1115", corner_radius=4, font=("Segoe UI", 13), text_color="#6b7280")
+    app.preview_area = left
+    app.preview_box = ctk.CTkLabel(left, width=1, height=1, text="Нажмите «Импорт папки» сверху,\nчтобы загрузить серию снимков", fg_color="#0f1115", corner_radius=4, font=("Segoe UI", 13), text_color="#6b7280")
     app.preview_box.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 6))
 
     ctrl = ctk.CTkFrame(left, fg_color="#22252b", height=42, corner_radius=4)
@@ -42,13 +45,32 @@ def build_lr_interface(app):
     app.frame_info = ctk.CTkLabel(ctrl, text="0 / 0", width=75, font=("Segoe UI", 11, "bold"), text_color="#d1d5db")
     app.frame_info.pack(side="right", padx=8)
 
-    right_container = ctk.CTkFrame(app, fg_color="#191b20", border_width=1, border_color="#28353a", corner_radius=6)
+    right_container = ctk.CTkFrame(app, width=440, fg_color="#191b20", border_width=1, border_color="#28353a", corner_radius=6)
     right_container.grid(row=2, column=1, sticky="nsew", padx=(5, 10), pady=4)
+    right_container.grid_propagate(False)
     right_container.grid_rowconfigure(0, weight=1)
     right_container.grid_columnconfigure(0, weight=1)
 
     right_scroll = ctk.CTkScrollableFrame(right_container, fg_color="transparent")
     right_scroll.grid(row=0, column=0, sticky="nsew", padx=2, pady=(4, 0))
+
+    # Allow the scrollable panel to receive the mouse wheel even when the
+    # pointer is over a CTkSlider. CustomTkinter normally rejects CTkSlider
+    # widgets in _check_if_valid_scroll(), which prevents the parent panel
+    # from scrolling. Slider wheel changes remain disabled separately with
+    # scroll_step=0 in make_lr_slider().
+    def _right_panel_accepts_scroll(widget):
+        if widget == right_scroll._parent_canvas:
+            return True
+        if isinstance(widget, (ctk.CTkScrollbar, ctk.CTkTextbox)):
+            return False
+        if isinstance(widget, ctk.CTkScrollableFrame):
+            return widget._parent_canvas == right_scroll._parent_canvas
+        if getattr(widget, "master", None) is not None:
+            return _right_panel_accepts_scroll(widget.master)
+        return False
+
+    right_scroll._check_if_valid_scroll = _right_panel_accepts_scroll
 
     build_right_panels(app, right_scroll)
 
@@ -104,6 +126,15 @@ def build_lr_interface(app):
     app.btn_test = ctk.CTkButton(act_box, text="Тест (3 сек)", width=95, height=40, font=("Segoe UI", 12, "bold"), fg_color="#7c3aed", hover_color="#6d28d9", command=lambda: app.start_render(is_test=True))
     app.btn_test.pack(side="left", padx=(0, 6))
 
+    app.frame_mode = getattr(app, "frame_mode", "Заполнить кадр")
+    app.frame_mode_var = ctk.StringVar(value=app.frame_mode)
+    app.frame_mode_menu = ctk.CTkOptionMenu(
+        act_box, values=["Вписать целиком", "Заполнить кадр", "Размытый фон"],
+        variable=app.frame_mode_var, width=132, height=40,
+        font=("Segoe UI", 10, "bold"), dropdown_font=("Segoe UI", 10),
+        command=lambda value: setattr(app, "frame_mode", value)
+    )
+    app.frame_mode_menu.pack(side="left", padx=(0, 6))
     app.btn_render = ctk.CTkButton(act_box, text="ЭКСПОРТ ТАЙМЛАПСА", height=40, font=("Segoe UI", 13, "bold"), fg_color="#059669", hover_color="#047857", command=lambda: app.start_render(is_test=False))
     app.btn_render.pack(side="left", fill="x", expand=True)
 

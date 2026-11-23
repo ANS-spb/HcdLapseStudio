@@ -1,5 +1,5 @@
 import customtkinter as ctk
-from lr_widgets import add_help_badge, make_lr_slider
+from lr_widgets import add_help_badge, make_lr_slider, make_lr_slider_with_entry
 
 def build_right_panels(app, right_scroll):
     pad_x = 20
@@ -49,7 +49,12 @@ def build_right_panels(app, right_scroll):
     app.sl_hi, _ = make_lr_slider(p_col, "Света (Highlights)", -1.0, 1.0, 0.0, 40, "{:+.2f}", lambda _: app.refresh_preview(), "Влево — приглушает слишком яркие участки (центр сияния, фонари), вправо — усиливает.")
     app.sl_sh, _ = make_lr_slider(p_col, "Тени (Shadows)", -1.0, 1.0, 0.0, 40, "{:+.2f}", lambda _: app.refresh_preview(), "Вправо — вытягивает детали из тёмной земли и переднего плана, влево — делает тени глубже.")
     app.sl_sat, _ = make_lr_slider(p_col, "Насыщенность", 0.0, 2.0, 1.0, 40, "{:.2f}", lambda _: app.refresh_preview(), "Усиливает изумрудные и фиолетовые оттенки сияния.")
-    app.sl_tmp, _ = make_lr_slider(p_col, "Температура", -1.0, 1.0, 0.0, 40, "{:+.2f}", lambda _: app.refresh_preview(), "Баланс белого: влево — глубокий ночной синий, вправо — теплее.")
+    app.sl_tmp, app.ent_tmp = make_lr_slider_with_entry(
+        p_col, "Temperature", -3000, 3000, 0, 120, "K", lambda _: app.refresh_preview(),
+        "Сдвиг температуры относительно баланса белого камеры. Плюс — теплее, минус — холоднее.")
+    app.sl_tint, app.ent_tint = make_lr_slider_with_entry(
+        p_col, "Tint", -100, 100, 0, 100, "", lambda _: app.refresh_preview(),
+        "Сдвиг оттенка: минус — в зелёный, плюс — в пурпурный.")
     app.sl_sharp, _ = make_lr_slider(p_col, "Резкость", 0.0, 2.0, 0.0, 40, "{:.2f}", lambda _: app.refresh_preview(), "Повышает микроконтраст и чёткость звёзд (0.00 — выключено).")
 
     p_zoom = ctk.CTkFrame(right_scroll, fg_color="#23252a", border_width=1, border_color="#2e383c", corner_radius=5)
@@ -68,3 +73,46 @@ def build_right_panels(app, right_scroll):
     app.sl_zoom_end, app.lbl_zoom_end = make_lr_slider(p_zoom, "Конечный зум (Финиш)", 1.0, 1.6, 1.25, 30, "{:.2f}x", lambda _: app.refresh_preview(), "Приближение в самом конце ролика (оранжевая рамка).")
     app.sl_end_x, app.lbl_end_x = make_lr_slider(p_zoom, "Финиш сдвиг X", -100, 100, 0, 40, "{:+.0f}%", lambda _: app.refresh_preview(), "Положение оранжевой рамки по горизонтали.")
     app.sl_end_y, app.lbl_end_y = make_lr_slider(p_zoom, "Финиш сдвиг Y", -100, 100, 0, 40, "{:+.0f}%", lambda _: app.refresh_preview(), "Положение оранжевой рамки по вертикали.")
+
+
+    # Коррекция объектива (Lensfun подключается отдельно, если установлен)
+    p_lens = ctk.CTkFrame(right_scroll, fg_color="#23252a", border_width=1, border_color="#2e383c", corner_radius=5)
+    p_lens.pack(fill="x", padx=pad_x, pady=5)
+    hl = ctk.CTkFrame(p_lens, fg_color="#2a2f36", corner_radius=4, height=26)
+    hl.pack(fill="x", padx=2, pady=2)
+    app.lens_sw = ctk.CTkSwitch(hl, text="Коррекция объектива (Lensfun)", font=("Segoe UI", 11, "bold"),
+                                progress_color="#10b981", command=app.refresh_preview)
+    app.lens_sw.pack(side="left", padx=6)
+    add_help_badge(hl, "Ищет профиль по EXIF камеры и объектива. Для работы нужны lensfunpy и OpenCV. Исправление применяется к предпросмотру и экспорту; если профиль не найден, кадр останется без изменений.")
+
+    # Аудиодорожка
+    p_audio = ctk.CTkFrame(right_scroll, fg_color="#23252a", border_width=1, border_color="#2e383c", corner_radius=5)
+    p_audio.pack(fill="x", padx=pad_x, pady=5)
+    ha = ctk.CTkFrame(p_audio, fg_color="#2a2f36", corner_radius=4, height=26)
+    ha.pack(fill="x", padx=2, pady=2)
+    ctk.CTkLabel(ha, text="  Аудио для таймлапса", font=("Segoe UI", 11, "bold"), text_color="#f4f4f5").pack(side="left")
+    add_help_badge(ha, "Можно выбрать музыку, обрезать её по времени, задать задержку старта и громкость. Пустая дорожка добавляет AAC-аудио с тишиной, чтобы MP4 не определялся как GIF.")
+
+    ar = ctk.CTkFrame(p_audio, fg_color="transparent")
+    ar.pack(fill="x", padx=8, pady=(5, 2))
+    app.audio_file_lbl = ctk.CTkLabel(ar, text="Аудио не выбрано", font=("Segoe UI", 10), text_color="#a1a1aa", anchor="w")
+    app.audio_file_lbl.pack(side="left", fill="x", expand=True)
+    ctk.CTkButton(ar, text="Выбрать", width=66, height=24, command=app.select_audio_file).pack(side="right", padx=(4, 0))
+    ctk.CTkButton(ar, text="Убрать", width=54, height=24, fg_color="#3b434d", command=app.clear_audio_file).pack(side="right")
+
+    ag = ctk.CTkFrame(p_audio, fg_color="transparent")
+    ag.pack(fill="x", padx=8, pady=4)
+    def _audio_entry(parent, title, default, col):
+        ctk.CTkLabel(parent, text=title, font=("Segoe UI", 10)).grid(row=0, column=col, sticky="w", padx=3)
+        ent = ctk.CTkEntry(parent, width=74, height=25, fg_color="#16181c", border_color="#3b434d")
+        ent.insert(0, default)
+        ent.grid(row=1, column=col, padx=3, pady=(2, 3), sticky="w")
+        return ent
+    app.audio_trim_start = _audio_entry(ag, "Обрезка с (сек.)", "0", 0)
+    app.audio_trim_end = _audio_entry(ag, "Обрезка до (сек.)", "0", 1)
+    app.audio_delay = _audio_entry(ag, "Старт через (сек.)", "0", 2)
+    app.audio_volume = _audio_entry(ag, "Громкость (%)", "100", 3)
+    ag.grid_columnconfigure((0, 1, 2, 3), weight=1)
+    app.audio_silence_sw = ctk.CTkCheckBox(p_audio, text="Добавить пустой аудиоряд (AAC)", font=("Segoe UI", 10),
+                                           command=app.on_audio_silence_toggle)
+    app.audio_silence_sw.pack(anchor="w", padx=10, pady=(2, 7))

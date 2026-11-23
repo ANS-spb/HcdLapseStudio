@@ -1,8 +1,10 @@
 import math
+from lr_white_balance import white_balance_gains
 
 def build_ffmpeg_filters(app, tw: int, th: int, fps: float, total_frames: int):
     angle = app.sl_rot.get()
-    exp, con, sat, tmp = app.sl_exp.get(), app.sl_con.get(), app.sl_sat.get(), app.sl_tmp.get()
+    exp, con, sat = app.sl_exp.get(), app.sl_con.get(), app.sl_sat.get()
+    tmp, tint = app.sl_tmp.get(), app.sl_tint.get()
     hi, sh, sharp = app.sl_hi.get(), app.sl_sh.get(), app.sl_sharp.get()
 
     use_zoom = bool(app.zoom_sw.get())
@@ -13,10 +15,14 @@ def build_ffmpeg_filters(app, tw: int, th: int, fps: float, total_frames: int):
     use_dn, dn_lvl = bool(app.denoise_sw.get()), int(app.sl_denoise.get())
     use_df, df_size = bool(app.deflicker_sw.get()), int(app.sl_deflicker.get())
 
-    flts = [
-        f"scale={tw}:{th}:force_original_aspect_ratio=increase",
-        f"crop={tw}:{th}"
-    ]
+    frame_mode = getattr(app, "frame_mode", "Заполнить кадр")
+    if "Вписать" in frame_mode or "Размытый" in frame_mode:
+        flts = [f"scale={tw}:{th}"]
+    else:
+        flts = [
+            f"scale={tw}:{th}:force_original_aspect_ratio=increase",
+            f"crop={tw}:{th}"
+        ]
 
     if abs(angle) >= 0.05:
         rad = math.radians(abs(angle))
@@ -36,10 +42,9 @@ def build_ffmpeg_filters(app, tw: int, th: int, fps: float, total_frames: int):
     if abs(exp) > 0.01 or abs(con - 1.0) > 0.01 or abs(sat - 1.0) > 0.01:
         br = exp * 0.22
         flts.append(f"eq=brightness={br:.3f}:contrast={con:.3f}:saturation={sat:.3f}")
-    if abs(tmp) > 0.01:
-        rs = tmp * 0.14
-        bs = -tmp * 0.14
-        flts.append(f"colorbalance=rs={rs:.3f}:gs=0:bs={bs:.3f}:rm={rs*0.7:.3f}:bm={bs*0.7:.3f}")
+    if abs(tmp) > 0.5 or abs(tint) > 0.5:
+        r_gain, g_gain, b_gain = white_balance_gains(tmp, tint)
+        flts.append(f"colorchannelmixer=rr={r_gain:.6f}:gg={g_gain:.6f}:bb={b_gain:.6f}")
 
     if sharp > 0.02:
         flts.append(f"unsharp=5:5:{sharp * 0.85:.2f}:5:5:0.0")

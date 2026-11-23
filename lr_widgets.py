@@ -50,6 +50,16 @@ def make_aurora_logo(parent):
     )
     lbl.pack(padx=4, pady=3)
 
+
+def _bind_parent_scroll(slider, parent):
+    """Intentionally do not bind mouse-wheel events to sliders.
+
+    CTkScrollableFrame handles scrolling itself. The slider must never
+    receive or redirect wheel input, so wheel events cannot change its value
+    or trigger custom scrolling logic.
+    """
+    return None
+
 def make_lr_slider(parent, label_text: str, from_val: float, to_val: float, default_val: float,
                    steps: int, fmt: str, command, tooltip: str):
     box = ctk.CTkFrame(parent, fg_color="transparent")
@@ -69,14 +79,82 @@ def make_lr_slider(parent, label_text: str, from_val: float, to_val: float, defa
     sl = ctk.CTkSlider(
         box, from_=from_val, to=to_val, number_of_steps=steps, height=14,
         fg_color="#3f3f46", progress_color="#0284c7", button_color="#e4e4e7", button_hover_color="#ffffff",
-        command=_on_change
+        command=_on_change,
+        scroll_step=0  # Disable CTkSlider mouse-wheel value changes; parent scroll frame still receives wheel events.
     )
     sl.set(default_val)
     sl.pack(fill="x", pady=(2, 2))
+    _bind_parent_scroll(sl, parent)
 
-    def _ignore_wheel(event):
+    # Do not intercept <MouseWheel> here. Returning "break" on the slider
+    # prevents the parent CTkScrollableFrame from receiving the event, so
+    # scrolling works only when the pointer is over empty space.
+    # CTkSlider does not need a wheel binding to keep its value unchanged.
+
+    # Lightroom-style reset: double-clicking the slider restores only this
+    # control to its own declared default value.
+    def _reset_on_double_click(_event=None):
+        sl.set(default_val)
+        _on_change(default_val)
         return "break"
-    sl.bind("<MouseWheel>", _ignore_wheel)
-    sl._canvas.bind("<MouseWheel>", _ignore_wheel)
+
+    # CTkSlider receives pointer events on its internal canvas. Bind there so
+    # the gesture works when the user double-clicks the track or the knob.
+    sl._canvas.bind("<Double-Button-1>", _reset_on_double_click, add="+")
 
     return sl, val_lbl
+
+
+def make_lr_slider_with_entry(parent, label_text: str, from_val: float, to_val: float, default_val: float,
+                              steps: int, unit: str, command, tooltip: str):
+    """Slider with an editable numeric value; keeps wheel scrolling on the parent."""
+    box = ctk.CTkFrame(parent, fg_color="transparent")
+    box.pack(fill="x", padx=10, pady=3)
+    hdr = ctk.CTkFrame(box, fg_color="transparent")
+    hdr.pack(fill="x")
+    ctk.CTkLabel(hdr, text=label_text, font=("Segoe UI", 11), text_color="#d4d4d8").pack(side="left")
+    add_help_badge(hdr, tooltip)
+    entry = ctk.CTkEntry(hdr, width=88, height=23, justify="right", font=("Segoe UI", 10),
+                         fg_color="#16181c", border_color="#3b434d")
+    entry.pack(side="right", padx=4)
+
+    def fmt(v):
+        return f"{int(round(float(v))):+d} {unit}"
+
+    def update(v, notify=True):
+        value = max(from_val, min(to_val, float(v)))
+        slider.set(value)
+        entry.delete(0, "end")
+        entry.insert(0, fmt(value))
+        if notify and command:
+            command(value)
+
+    def on_slider(v):
+        entry.delete(0, "end")
+        entry.insert(0, fmt(v))
+        if command:
+            command(v)
+
+    slider = ctk.CTkSlider(box, from_=from_val, to=to_val, number_of_steps=steps, height=14,
+        fg_color="#3f3f46", progress_color="#0284c7", button_color="#e4e4e7",
+        button_hover_color="#ffffff", command=on_slider, scroll_step=0)
+    slider.set(default_val)
+    slider.pack(fill="x", pady=(2, 2))
+    _bind_parent_scroll(slider, parent)
+    entry.insert(0, fmt(default_val))
+
+    def commit(_event=None):
+        raw = entry.get().strip().lower().replace(unit.lower(), "").replace("k", "").strip()
+        try:
+            update(float(raw))
+        except ValueError:
+            update(slider.get(), notify=False)
+
+    entry.bind("<Return>", commit)
+    entry.bind("<FocusOut>", commit)
+
+    def reset(_event=None):
+        update(default_val)
+        return "break"
+    slider._canvas.bind("<Double-Button-1>", reset, add="+")
+    return slider, entry
